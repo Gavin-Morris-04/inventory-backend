@@ -1,113 +1,44 @@
-// Alternative server.js - Uses query parameters instead of route parameters
+// server.js
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const prisma = new PrismaClient();
 
-// Create SQLite database
-const dbPath = path.join(__dirname, 'inventory.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('❌ Error opening database:', err.message);
-    process.exit(1);
-  } else {
-    console.log('🗄️  SQLite database connected:', dbPath);
-  }
-});
-
-// Initialize database
-const initDatabase = () => {
-  console.log('🔧 Setting up database tables...');
-  
-  db.run('PRAGMA foreign_keys = ON');
-  
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      name TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-  
-  db.run(`
-    CREATE TABLE IF NOT EXISTS items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      quantity INTEGER NOT NULL DEFAULT 0,
-      barcode TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users (id),
-      UNIQUE(user_id, barcode)
-    )
-  `);
-  
-  db.run(`
-    CREATE TABLE IF NOT EXISTS activities (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      item_name TEXT NOT NULL,
-      type TEXT NOT NULL,
-      quantity INTEGER,
-      old_quantity INTEGER,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users (id)
-    )
-  `);
-  
-  // Create demo user
-  const demoEmail = 'demo@inventory.com';
-  const demoPassword = bcrypt.hashSync('demo123', 10);
-  
-  db.get('SELECT * FROM users WHERE email = ?', [demoEmail], (err, row) => {
-    if (!row) {
-      db.run(
-        'INSERT INTO users (email, password, name) VALUES (?, ?, ?)',
-        [demoEmail, demoPassword, 'Demo User'],
-        function(err) {
-          if (!err) {
-            console.log('✅ Demo user created: demo@inventory.com / demo123');
-          }
-        }
-      );
-    }
-  });
-  
-  console.log('✅ Database tables ready');
-};
-
-initDatabase();
-
-// Middleware
+// Security middleware
+app.use(helmet());
+app.use(compression());
 app.use(cors({
-  origin: [
-    'http://localhost:3000', 
-    'http://127.0.0.1:3000', 
-    'http://localhost:8080',
-    /\.railway\.app$/,  // Allow all Railway subdomains
-    /\.vercel\.app$/,   // Allow Vercel if you deploy frontend there
-    /\.netlify\.app$/   // Allow Netlify if you deploy frontend there
-  ],
+  origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
   credentials: true
 }));
 app.use(express.json());
 
-// Request logging
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  next();
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
 });
+app.use('/api/', limiter);
+
+// Auth rate limiting (stricter)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many login attempts, please try again later'
+});
+app.use('/api/auth/', authLimiter);
 
 // JWT middleware
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -115,298 +46,654 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, 'fallback-secret-key', (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid token' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Get user with company info
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+      include: { company: true }
+    });
+
+    if (!user || !user.isActive || !user.company.isActive) {
+      return res.status(403).json({ error: 'Access denied' });
     }
+
+    // Check if trial has expired
+    if (user.company.subscriptionTier === 'trial' && new Date() > new Date(user.company.trialEndsAt)) {
+      return res.status(403).json({ error: 'Trial period has expired. Please upgrade your subscription.' });
+    }
+
     req.user = user;
+    req.companyId = user.companyId;
     next();
-  });
+  } catch (err) {
+    return res.status(403).json({ error: 'Invalid token' });
+  }
 };
 
-// Helper
-const generateBarcode = (id) => 'INV' + id.toString().padStart(6, '0');
+// Admin middleware
+const requireAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+};
 
-// ROUTES - No route parameters, using query strings and body data instead
+// Generate company code
+const generateCompanyCode = (companyName) => {
+  const prefix = companyName
+    .split(' ')
+    .map(word => word[0])
+    .join('')
+    .toUpperCase()
+    .slice(0, 3);
+  const suffix = Math.random().toString(36).substring(2, 5).toUpperCase();
+  return `${prefix}${suffix}`;
+};
+
+// ROUTES
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    database: 'SQLite'
+    version: '2.0.0'
   });
 });
 
-// Auth routes
-app.post('/api/register', async (req, res) => {
+// Company Registration
+app.post('/api/companies/register', async (req, res) => {
   try {
-    const { email, password, name } = req.body;
-    
-    if (!email || !password || !name) {
+    const { companyName, adminEmail, adminPassword, adminName } = req.body;
+
+    if (!companyName || !adminEmail || !adminPassword || !adminName) {
       return res.status(400).json({ error: 'All fields are required' });
     }
-    
-    db.get('SELECT * FROM users WHERE email = ?', [email.toLowerCase()], async (err, row) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
-      }
-      
-      if (row) {
-        return res.status(400).json({ error: 'Email already exists' });
-      }
-      
-      const hashedPassword = await bcrypt.hash(password, 12);
-      
-      db.run(
-        'INSERT INTO users (email, password, name) VALUES (?, ?, ?)',
-        [email.toLowerCase(), hashedPassword, name],
-        function(err) {
-          if (err) {
-            return res.status(500).json({ error: 'Failed to create user' });
-          }
-          
-          const token = jwt.sign({ userId: this.lastID }, 'fallback-secret-key', { expiresIn: '7d' });
-          
-          res.status(201).json({
-            success: true,
-            user: { id: this.lastID, email: email.toLowerCase(), name },
-            token
-          });
+
+    // Check if email already exists in any company
+    const existingUser = await prisma.user.findFirst({
+      where: { email: adminEmail.toLowerCase() }
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
+
+    // Generate unique company code
+    let companyCode = generateCompanyCode(companyName);
+    let codeExists = await prisma.company.findUnique({ where: { code: companyCode } });
+    while (codeExists) {
+      companyCode = generateCompanyCode(companyName);
+      codeExists = await prisma.company.findUnique({ where: { code: companyCode } });
+    }
+
+    // Create company and admin user in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // Create company
+      const company = await tx.company.create({
+        data: {
+          name: companyName,
+          code: companyCode,
+          subscriptionTier: 'trial'
         }
-      );
+      });
+
+      // Create admin user
+      const hashedPassword = await bcrypt.hash(adminPassword, 12);
+      const user = await tx.user.create({
+        data: {
+          email: adminEmail.toLowerCase(),
+          password: hashedPassword,
+          name: adminName,
+          role: 'admin',
+          companyId: company.id
+        }
+      });
+
+      return { company, user };
+    });
+
+    // Generate token
+    const token = jwt.sign(
+      { userId: result.user.id },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.status(201).json({
+      success: true,
+      token,
+      user: {
+        id: result.user.id,
+        email: result.user.email,
+        name: result.user.name,
+        role: result.user.role
+      },
+      company: {
+        id: result.company.id,
+        name: result.company.name,
+        code: result.company.code,
+        subscriptionTier: result.company.subscriptionTier
+      }
     });
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Failed to register company' });
   }
 });
 
-app.post('/api/login', (req, res) => {
+// Login
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    
+
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
     }
-    
-    db.get('SELECT * FROM users WHERE email = ?', [email.toLowerCase()], async (err, user) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
+
+    // Find user and include company
+    const user = await prisma.user.findFirst({
+      where: { 
+        email: email.toLowerCase(),
+        isActive: true
+      },
+      include: { company: true }
+    });
+
+    if (!user || !await bcrypt.compare(password, user.password)) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+
+    if (!user.company.isActive) {
+      return res.status(403).json({ error: 'Company account is suspended' });
+    }
+
+    // Update last login
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { lastLogin: new Date() }
+    });
+
+    const token = jwt.sign(
+      { userId: user.id },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role
+      },
+      company: {
+        id: user.company.id,
+        name: user.company.name,
+        code: user.company.code,
+        subscriptionTier: user.company.subscriptionTier,
+        maxUsers: user.company.maxUsers
       }
-      
-      if (!user) {
-        return res.status(400).json({ error: 'Invalid credentials' });
-      }
-      
-      const validPassword = await bcrypt.compare(password, user.password);
-      if (!validPassword) {
-        return res.status(400).json({ error: 'Invalid credentials' });
-      }
-      
-      const token = jwt.sign({ userId: user.id }, 'fallback-secret-key', { expiresIn: '7d' });
-      
-      res.json({
-        success: true,
-        user: { id: user.id, email: user.email, name: user.name },
-        token
-      });
     });
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Login failed' });
   }
 });
 
-// Items routes - using query parameters instead of route parameters
-app.get('/api/items', authenticateToken, (req, res) => {
-  db.all(
-    'SELECT * FROM items WHERE user_id = ? ORDER BY created_at DESC',
-    [req.user.userId],
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: 'Failed to get items' });
+// Get company info
+app.get('/api/companies/info', authenticateToken, async (req, res) => {
+  try {
+    const company = await prisma.company.findUnique({
+      where: { id: req.companyId },
+      include: {
+        _count: {
+          select: { users: true, items: true }
+        }
       }
-      res.json(rows);
+    });
+
+    res.json({
+      company: {
+        ...company,
+        userCount: company._count.users,
+        itemCount: company._count.items
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching company info:', error);
+    res.status(500).json({ error: 'Failed to fetch company info' });
+  }
+});
+
+// Items routes
+app.get('/api/items', authenticateToken, async (req, res) => {
+  try {
+    const items = await prisma.item.findMany({
+      where: { companyId: req.companyId },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(items);
+  } catch (error) {
+    console.error('Error fetching items:', error);
+    res.status(500).json({ error: 'Failed to fetch items' });
+  }
+});
+
+app.post('/api/items', authenticateToken, async (req, res) => {
+  try {
+    const { name, quantity, barcode } = req.body;
+
+    if (!name || quantity === undefined) {
+      return res.status(400).json({ error: 'Name and quantity required' });
     }
-  );
-});
 
-app.post('/api/items', authenticateToken, (req, res) => {
-  const { name, quantity, barcode } = req.body;
-  
-  if (!name || quantity === undefined) {
-    return res.status(400).json({ error: 'Name and quantity required' });
-  }
-  
-  const itemBarcode = barcode || generateBarcode(Date.now());
-  
-  db.run(
-    'INSERT INTO items (user_id, name, quantity, barcode) VALUES (?, ?, ?, ?)',
-    [req.user.userId, name.trim(), parseInt(quantity), itemBarcode],
-    function(err) {
-      if (err) {
-        if (err.message.includes('UNIQUE constraint')) {
-          return res.status(400).json({ error: 'Barcode already exists' });
-        }
-        return res.status(500).json({ error: 'Failed to create item' });
+    // Check if barcode exists in company
+    const existingItem = await prisma.item.findFirst({
+      where: {
+        barcode,
+        companyId: req.companyId
       }
-      
-      db.run(
-        'INSERT INTO activities (user_id, item_name, type, quantity) VALUES (?, ?, ?, ?)',
-        [req.user.userId, name.trim(), 'created', parseInt(quantity)]
-      );
-      
-      db.get('SELECT * FROM items WHERE id = ?', [this.lastID], (err, row) => {
-        if (err) {
-          return res.status(500).json({ error: 'Failed to get created item' });
+    });
+
+    if (existingItem) {
+      return res.status(400).json({ error: 'Barcode already exists' });
+    }
+
+    // Create item and activity in transaction
+    const result = await prisma.$transaction(async (tx) => {
+      const item = await tx.item.create({
+        data: {
+          name: name.trim(),
+          quantity: parseInt(quantity),
+          barcode,
+          companyId: req.companyId
         }
-        res.status(201).json(row);
       });
-    }
-  );
-});
 
-// Update item - using query parameter ?id=123
-app.put('/api/items', authenticateToken, (req, res) => {
-  const { id, quantity } = req.body;
-  
-  if (!id || quantity === undefined) {
-    return res.status(400).json({ error: 'ID and quantity required' });
-  }
-  
-  db.get(
-    'SELECT * FROM items WHERE id = ? AND user_id = ?',
-    [id, req.user.userId],
-    (err, item) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
-      }
-      
-      if (!item) {
-        return res.status(404).json({ error: 'Item not found' });
-      }
-      
-      const oldQuantity = item.quantity;
-      const quantityChange = parseInt(quantity) - oldQuantity;
-      
-      db.run(
-        'UPDATE items SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?',
-        [parseInt(quantity), id, req.user.userId],
-        function(err) {
-          if (err) {
-            return res.status(500).json({ error: 'Failed to update item' });
-          }
-          
-          if (quantityChange !== 0) {
-            const activityType = quantityChange > 0 ? 'added' : 'removed';
-            db.run(
-              'INSERT INTO activities (user_id, item_name, type, quantity, old_quantity) VALUES (?, ?, ?, ?, ?)',
-              [req.user.userId, item.name, activityType, Math.abs(quantityChange), oldQuantity]
-            );
-          }
-          
-          db.get('SELECT * FROM items WHERE id = ?', [id], (err, updatedItem) => {
-            if (err) {
-              return res.status(500).json({ error: 'Failed to get updated item' });
-            }
-            res.json(updatedItem);
-          });
+      await tx.activity.create({
+        data: {
+          type: 'created',
+          quantity: parseInt(quantity),
+          userId: req.user.id,
+          itemId: item.id,
+          companyId: req.companyId
         }
-      );
-    }
-  );
+      });
+
+      return item;
+    });
+
+    res.status(201).json(result);
+  } catch (error) {
+    console.error('Error creating item:', error);
+    res.status(500).json({ error: 'Failed to create item' });
+  }
 });
 
-// Delete item - using query parameter
-app.delete('/api/items', authenticateToken, (req, res) => {
-  const { id } = req.body;
-  
-  if (!id) {
-    return res.status(400).json({ error: 'ID required' });
-  }
-  
-  db.get(
-    'SELECT * FROM items WHERE id = ? AND user_id = ?',
-    [id, req.user.userId],
-    (err, item) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
+app.put('/api/items', authenticateToken, async (req, res) => {
+  try {
+    const { id, quantity } = req.body;
+
+    if (!id || quantity === undefined) {
+      return res.status(400).json({ error: 'ID and quantity required' });
+    }
+
+    // Get current item
+    const currentItem = await prisma.item.findFirst({
+      where: {
+        id,
+        companyId: req.companyId
       }
-      
-      if (!item) {
-        return res.status(404).json({ error: 'Item not found' });
-      }
-      
-      db.run(
-        'DELETE FROM items WHERE id = ? AND user_id = ?',
-        [id, req.user.userId],
-        function(err) {
-          if (err) {
-            return res.status(500).json({ error: 'Failed to delete item' });
+    });
+
+    if (!currentItem) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    const oldQuantity = currentItem.quantity;
+    const quantityChange = parseInt(quantity) - oldQuantity;
+
+    // Update item and create activity in transaction
+    const result = await prisma.$transaction(async (tx) => {
+      const item = await tx.item.update({
+        where: { id },
+        data: { quantity: parseInt(quantity) }
+      });
+
+      if (quantityChange !== 0) {
+        await tx.activity.create({
+          data: {
+            type: quantityChange > 0 ? 'added' : 'removed',
+            quantity: Math.abs(quantityChange),
+            oldQuantity,
+            userId: req.user.id,
+            itemId: item.id,
+            companyId: req.companyId
           }
-          
-          db.run(
-            'INSERT INTO activities (user_id, item_name, type, quantity) VALUES (?, ?, ?, ?)',
-            [req.user.userId, item.name, 'deleted', item.quantity]
-          );
-          
-          res.json({ success: true, message: 'Item deleted' });
-        }
-      );
-    }
-  );
+        });
+      }
+
+      return item;
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error updating item:', error);
+    res.status(500).json({ error: 'Failed to update item' });
+  }
 });
 
-// Find item by barcode - using query parameter ?barcode=INV000001
-app.get('/api/items/search', authenticateToken, (req, res) => {
-  const { barcode } = req.query;
-  
-  if (!barcode) {
-    return res.status(400).json({ error: 'Barcode required' });
-  }
-  
-  db.get(
-    'SELECT * FROM items WHERE user_id = ? AND barcode = ?',
-    [req.user.userId, barcode],
-    (err, item) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
-      }
-      
-      if (!item) {
-        return res.status(404).json({ error: 'Item not found' });
-      }
-      
-      res.json(item);
+app.delete('/api/items', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: 'ID required' });
     }
-  );
+
+    // Get item before deletion
+    const item = await prisma.item.findFirst({
+      where: {
+        id,
+        companyId: req.companyId
+      }
+    });
+
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    // Create deletion activity then delete item
+    await prisma.$transaction(async (tx) => {
+      await tx.activity.create({
+        data: {
+          type: 'deleted',
+          quantity: item.quantity,
+          userId: req.user.id,
+          itemId: item.id,
+          companyId: req.companyId,
+          notes: `Deleted item: ${item.name}`
+        }
+      });
+
+      await tx.item.delete({
+        where: { id }
+      });
+    });
+
+    res.json({ success: true, message: 'Item deleted' });
+  } catch (error) {
+    console.error('Error deleting item:', error);
+    res.status(500).json({ error: 'Failed to delete item' });
+  }
+});
+
+app.get('/api/items/search', authenticateToken, async (req, res) => {
+  try {
+    const { barcode } = req.query;
+
+    if (!barcode) {
+      return res.status(400).json({ error: 'Barcode required' });
+    }
+
+    const item = await prisma.item.findFirst({
+      where: {
+        barcode,
+        companyId: req.companyId
+      }
+    });
+
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    res.json(item);
+  } catch (error) {
+    console.error('Error searching item:', error);
+    res.status(500).json({ error: 'Failed to search item' });
+  }
 });
 
 // Activities
-app.get('/api/activities', authenticateToken, (req, res) => {
-  const limit = parseInt(req.query.limit) || 100;
-  
-  db.all(
-    'SELECT * FROM activities WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
-    [req.user.userId, limit],
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: 'Failed to get activities' });
-      }
-      res.json(rows);
+app.get('/api/activities', authenticateToken, async (req, res) => {
+  try {
+    const { limit = 100 } = req.query;
+
+    const activities = await prisma.activity.findMany({
+      where: { companyId: req.companyId },
+      include: {
+        user: {
+          select: { name: true, email: true }
+        },
+        item: {
+          select: { name: true, barcode: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' },
+      take: parseInt(limit)
+    });
+
+    // Format response
+    const formattedActivities = activities.map(activity => ({
+      id: activity.id,
+      type: activity.type,
+      quantity: activity.quantity,
+      oldQuantity: activity.oldQuantity,
+      itemName: activity.item.name,
+      userName: activity.user.name,
+      createdAt: activity.createdAt
+    }));
+
+    res.json(formattedActivities);
+  } catch (error) {
+    console.error('Error fetching activities:', error);
+    res.status(500).json({ error: 'Failed to fetch activities' });
+  }
+});
+
+// User management (Admin only)
+app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      where: { companyId: req.companyId },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        isActive: true,
+        lastLogin: true,
+        createdAt: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    res.json(users);
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+app.post('/api/users/invite', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { email, name, role = 'user' } = req.body;
+
+    if (!email || !name) {
+      return res.status(400).json({ error: 'Email and name required' });
     }
-  );
+
+    // Check if user already exists in company
+    const existingUser = await prisma.user.findFirst({
+      where: {
+        email: email.toLowerCase(),
+        companyId: req.companyId
+      }
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists in company' });
+    }
+
+    // Check user limit
+    const userCount = await prisma.user.count({
+      where: { companyId: req.companyId }
+    });
+
+    if (userCount >= req.user.company.maxUsers) {
+      return res.status(403).json({ error: 'User limit reached. Please upgrade your plan.' });
+    }
+
+    // Create invitation
+    const invitation = await prisma.invitation.create({
+      data: {
+        email: email.toLowerCase(),
+        name,
+        role,
+        token: uuidv4(),
+        companyId: req.companyId
+      }
+    });
+
+    // TODO: Send invitation email
+    // await sendInvitationEmail(email, name, invitation.token);
+
+    res.json({
+      success: true,
+      message: 'Invitation sent successfully',
+      invitationId: invitation.id
+    });
+  } catch (error) {
+    console.error('Error inviting user:', error);
+    res.status(500).json({ error: 'Failed to invite user' });
+  }
+});
+
+app.delete('/api/users/delete', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID required' });
+    }
+
+    // Prevent self-deletion
+    if (userId === req.user.id) {
+      return res.status(400).json({ error: 'Cannot delete your own account' });
+    }
+
+    // Ensure user belongs to same company
+    const user = await prisma.user.findFirst({
+      where: {
+        id: userId,
+        companyId: req.companyId
+      }
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Soft delete (mark as inactive)
+    await prisma.user.update({
+      where: { id: userId },
+      data: { isActive: false }
+    });
+
+    res.json({ success: true, message: 'User removed successfully' });
+  } catch (error) {
+    console.error('Error deleting user:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
+  }
+});
+
+// Analytics
+app.get('/api/analytics', authenticateToken, async (req, res) => {
+  try {
+    const [itemStats, activityStats, userStats] = await Promise.all([
+      // Item statistics
+      prisma.item.aggregate({
+        where: { companyId: req.companyId },
+        _count: true,
+        _sum: { quantity: true }
+      }),
+      
+      // Activity statistics (last 30 days)
+      prisma.activity.groupBy({
+        by: ['type'],
+        where: {
+          companyId: req.companyId,
+          createdAt: {
+            gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+          }
+        },
+        _count: true
+      }),
+      
+      // User statistics
+      prisma.user.aggregate({
+        where: { 
+          companyId: req.companyId,
+          isActive: true 
+        },
+        _count: true
+      })
+    ]);
+
+    // Low stock items
+    const lowStockItems = await prisma.item.count({
+      where: {
+        companyId: req.companyId,
+        quantity: { lte: 5, gt: 0 }
+      }
+    });
+
+    const outOfStockItems = await prisma.item.count({
+      where: {
+        companyId: req.companyId,
+        quantity: 0
+      }
+    });
+
+    res.json({
+      items: {
+        total: itemStats._count,
+        totalQuantity: itemStats._sum.quantity || 0,
+        lowStock: lowStockItems,
+        outOfStock: outOfStockItems
+      },
+      activities: activityStats,
+      users: {
+        total: userStats._count
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching analytics:', error);
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
 });
 
 // Error handling
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(500).json({ error: 'Server error' });
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
+// Start server
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Multi-tenant server running on port ${PORT}`);
   console.log(`📍 Health check: http://localhost:${PORT}/health`);
-  console.log(`💾 Database: ${dbPath}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  await prisma.$disconnect();
+  process.exit(0);
 });

@@ -1,0 +1,111 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id               String    @id @default(uuid())
+  name             String
+  code             String    @unique
+  subscriptionTier String    @default("trial")
+  maxUsers         Int       @default(5)
+  isActive         Boolean   @default(true)
+  trialEndsAt      DateTime  @default(dbgenerated("NOW() + INTERVAL '30 days'"))
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  users       User[]
+  items       Item[]
+  activities  Activity[]
+  invitations Invitation[]
+
+  @@index([code])
+  @@index([isActive])
+}
+
+model User {
+  id         String    @id @default(uuid())
+  email      String
+  password   String
+  name       String
+  role       String    @default("user")
+  isActive   Boolean   @default(true)
+  lastLogin  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  companyId  String
+  company    Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  activities Activity[]
+
+  @@unique([email, companyId])
+  @@index([email])
+  @@index([companyId])
+}
+
+model Item {
+  id         String    @id @default(uuid())
+  name       String
+  quantity   Int       @default(0)
+  barcode    String
+  location   String?
+  minStock   Int       @default(5)
+  category   String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  companyId  String
+  company    Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  activities Activity[]
+
+  @@unique([barcode, companyId])
+  @@index([companyId])
+  @@index([barcode])
+}
+
+model Activity {
+  id          String    @id @default(uuid())
+  type        String
+  quantity    Int?
+  oldQuantity Int?
+  notes       String?
+  createdAt   DateTime  @default(now())
+
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  
+  itemId      String
+  item        Item      @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  
+  companyId   String
+  company     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, createdAt])
+  @@index([itemId])
+  @@index([userId])
+}
+
+model Invitation {
+  id         String    @id @default(uuid())
+  email      String
+  name       String
+  role       String    @default("user")
+  token      String    @unique
+  expiresAt  DateTime  @default(dbgenerated("NOW() + INTERVAL '7 days'"))
+  acceptedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  companyId  String
+  company    Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([email])
+  @@index([companyId])
+}
